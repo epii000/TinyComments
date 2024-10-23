@@ -3,6 +3,8 @@
 local voucherId = ARGV[1]
 -- 1.2 用户id
 local userId = ARGV[2]
+-- 1.3、订单id
+local orderId = ARGV[3];
 
 -- 2.
 -- 2.1.库存key
@@ -26,8 +28,7 @@ redis.call('incrby', stockKey, -1);
 -- 3.4、下单（保存用户信息到订单中）sadd orderKey userId
 redis.call('sadd', orderKey, userId);
 -- 3.5、扣减成功，返回0
-
---[[-- TODO 发送消息到队列中前，先要使用命令行加入组：XGROUP create stream.orders g1 0 mkstream 【stream.orders加到组g1中，从0开始】
+-- TODO 发送消息到队列中前，先要使用命令行加入组：XGROUP create stream.orders g1 0 mkstream 【stream.orders加到组g1中，从0开始】
 -- 3.6、发送消息到队列中，xadd stream.orders * k1 v1 k2 v2
-redis.call('xadd', 'stream.orders', '*', 'userId', userId, 'voucherId', voucherId, 'id', orderId);]]
+redis.call('xadd', 'stream.orders', '*', 'userId', userId, 'voucherId', voucherId, 'id', orderId);
 return 0;
