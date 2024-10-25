@@ -4,6 +4,7 @@ import cn.hutool.core.util.BooleanUtil;
 import cn.hutool.core.util.StrUtil;
 import cn.hutool.json.JSONObject;
 import cn.hutool.json.JSONUtil;
+import com.baomidou.mybatisplus.extension.plugins.pagination.Page;
 import com.hmdp.dto.Result;
 import com.hmdp.entity.Shop;
 import com.hmdp.mapper.ShopMapper;
@@ -12,15 +13,23 @@ import com.baomidou.mybatisplus.extension.service.impl.ServiceImpl;
 import com.hmdp.redis.CacheClient;
 import com.hmdp.redis.RedisConstants;
 import com.hmdp.redis.RedisData;
+import com.hmdp.utils.SystemConstants;
+import org.springframework.data.geo.*;
+import org.springframework.data.redis.connection.RedisGeoCommands;
 import org.springframework.data.redis.core.StringRedisTemplate;
+import org.springframework.data.redis.domain.geo.GeoLocation;
+import org.springframework.data.redis.domain.geo.GeoReference;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
 import javax.annotation.Resource;
 import java.time.LocalDateTime;
+import java.util.*;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
+
+import static com.hmdp.redis.RedisConstants.SHOP_GEO_KEY;
 
 /**
  * <p>
@@ -174,6 +183,65 @@ public class ShopServiceImpl extends ServiceImpl<ShopMapper, Shop> implements IS
         updateById(shop);
         stringRedisTemplate.delete(RedisConstants.CACHE_SHOP_KEY + shop.getId());
         return Result.ok();
+    }
+
+    @Override
+    public Result queryShopByType(Integer typeId, Integer current, Double x, Double y) {
+        // 1.判断是否需要根据坐标查询
+        if (x == null || y == null) {
+            Page<Shop> page = query()
+                    .eq("type_id", typeId)
+                    .page(new Page<>(current, SystemConstants.DEFAULT_PAGE_SIZE));
+            return Result.ok(page.getRecords());
+        }
+        // 2.计算分页参数
+        int from = (current - 1) * SystemConstants.DEFAULT_PAGE_SIZE;
+        int end = current * SystemConstants.DEFAULT_PAGE_SIZE;
+
+        // 3.查询redis，按照距离分页。结果：shopId、distance
+        String key = SHOP_GEO_KEY + typeId;
+        GeoResults<RedisGeoCommands.GeoLocation<String>> results = stringRedisTemplate.opsForGeo()
+                .search(
+                        key,
+                        GeoReference.fromCoordinate(x, y),
+                        new Distance(5000), // 周围5000米范围
+                        RedisGeoCommands.GeoSearchCommandArgs.newGeoSearchArgs().includeDistance().limit(end)
+                );
+        // 4、获取集合，解析出shopId
+        if (results == null) {
+            return Result.ok(Collections.emptyList());
+        }
+        List<GeoResult<RedisGeoCommands.GeoLocation<String>>> list = results.getContent();
+        // 判断集合和分页头的大小，如果list小于from，skip跳过后就没内容了，就会报空指针异常
+        if (list.size() <= from) {
+            // 没有下一页，不能滚动翻页了，直接返回
+            return Result.ok(Collections.emptyList());
+        }
+        // 4.1、截取从from ~ end的部分(subList、或者stream流都可以，这里用stream流的方式：不需要拷贝集合，只是跳过，更加节省内存)
+        // 通过list列表去收集后面的店铺id
+        List<Long> ids = new ArrayList<>(list.size());
+        // 通过Map集合让id和distance一一对应(key: id字符串，value：Distance)
+        Map<String, Distance> distanceMap = new HashMap<>(list.size());
+        list.stream().skip(from).forEach(result -> { // 跳过再遍历
+            // 4.2、获取店铺id
+            String shopIdStr = result.getContent().getName();
+            // 4.3、将id转换为Long型，存入用于后面查询获得对象
+            ids.add(Long.valueOf(shopIdStr));
+            // 4.4、获取店铺到当前用户的距离
+            Distance distance = result.getDistance();
+            // 4.5、id和distance做匹配，一起返回
+            distanceMap.put(shopIdStr, distance);
+
+        });
+        // 5、根据shopId查询数据库获得shop对象
+        String idStr = StrUtil.join(",", ids);
+        List<Shop> shops = query().in("id", ids).last("ORDER BY FIELD(id," + idStr + ")").list();
+        // 6、将店铺和距离一一对应合并在一起
+        for (Shop shop : shops) {
+            shop.setDistance(distanceMap.get(shop.getId().toString()).getValue());
+        }
+        // 7、返回
+        return Result.ok(shops);
     }
 
     private boolean tryLock(String key) {
